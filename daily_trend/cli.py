@@ -6,7 +6,8 @@
   trend buzz         話題元（HN / はてブ など）を開く
   trend cite         引用元を Markdown で表示（クリップボードにもコピー）
   trend ls           過去の見出し一覧
-  trend run          今日の1件を生成（--force で別の記事に作り直し、--if-missing で未生成時のみ）
+  trend run          今日の1件を生成（--force で別の記事に作り直し、--if-missing で未生成時のみ、
+                     --focus news|blogs|oss|papers で種類を絞る）
   trend path         データの場所を表示
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import traceback
 from datetime import date, timedelta
+from urllib.parse import urlsplit
 
 from . import extract, rank, render, sources, store, summarize
 from .common import DATA, DAYS, LOGS, load_config, now_local, today_str
@@ -29,6 +31,7 @@ log = logging.getLogger("daily_trend")
 EXIT_BUSY = 75
 
 MAX_REPAIRS = 2  # 裏付けの無い箇所の書き直しは最大2回（1回あたり約 $0.03）
+AVOID_TOPIC_DAYS = 7  # この日数のあいだに出した記事と同じ話題は、別の記事でも選ばせない
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -128,7 +131,7 @@ def build_record(day: str, c, art, summ: dict, evidence: list[dict], model: str,
     }
 
 
-def run(force: bool, if_missing: bool, dry_run: bool) -> int:
+def run(force: bool, if_missing: bool, dry_run: bool, focus: str | None = None) -> int:
     day = today_str()
     if (if_missing or not force) and (DAYS / f"{day}.json").exists():
         log.info("already generated for %s", day)
@@ -146,26 +149,43 @@ def run(force: bool, if_missing: bool, dry_run: bool) -> int:
     pick_cfg = cfg.get("pick", {})
     model = pick_cfg.get("model", "claude-opus-5")
     observed_at = now_local().isoformat(timespec="seconds")
+    try:
+        focus, weights = rank.focus_weights(pick_cfg, focus)
+    except ValueError as e:
+        if focus:  # コマンドで指定した値が悪いときは止める
+            raise
+        # config.toml の書き間違いで毎朝の生成を止めない
+        log.warning("config.toml の [pick] focus を読めないので balanced で続けます: %s", e)
+        focus, weights = rank.focus_weights({})
+    feeds = cfg.get("feeds", {})
+    # 企業ブログの記事は、はてブや HN 経由で候補に入ったときも「テックブログ」として扱う
+    blog_hosts = tuple(h for h in (urlsplit(u).hostname for u in sources.feed_urls(feeds, "techblogs").values()) if h)
+    log.info("focus: %s %s", focus, weights)
 
-    cands, errors = sources.fetch_all(cfg.get("sources", {}))
+    cands, errors = sources.fetch_all(cfg.get("sources", {}), feeds)
     for k, e in errors.items():
         log.warning("source %s failed: %s", k, e)
     log.info("fetched %d candidates from %d sources", len(cands), len({c.source for c in cands}))
     # 作り直し（--force）のときは、今日すでに出した記事も既出として除き、別の記事を選ぶ
     shown_today = store.shown(store.load_day(day))
     hist = store.history(day, int(pick_cfg.get("dedupe_days", 30))) + shown_today
-    short, dropped = rank.shortlist(cands, hist, int(pick_cfg.get("max_candidates", 40)))
-    store.save_candidates(day, {"observed_at": observed_at, "errors": errors, "dropped_as_seen": dropped,
-                                "shortlist": [c.to_dict() for c in short]})
+    short, dropped = rank.shortlist(cands, hist, int(pick_cfg.get("max_candidates", 60)),
+                                    weights=weights, blog_hosts=blog_hosts)
+    store.save_candidates(day, {"observed_at": observed_at, "focus": focus, "weights": weights, "errors": errors,
+                                "dropped_as_seen": dropped, "shortlist": [c.to_dict() for c in short]})
     if not short:
         log.error("no candidates")
-        print("候補が0件でした。ネットワークか取得元を確認してください。", file=sys.stderr)
+        print("候補が0件でした。ネットワークか取得元を確認してください。"
+              + ("種類を絞っている場合は、その種類の未表示の候補が残っていません。" if focus != "balanced" else ""), file=sys.stderr)
         return 1
 
     if if_missing:
         attempts.write_text(str(n + 1))  # ネットワーク取得まで成功し、API を呼ぶ回だけ数える
+    # 同じ記事は shortlist で除いてある。ここでは、同じ話題を扱う別の記事を選ばせないために題名を渡す
+    recent = store.history(day, AVOID_TOPIC_DAYS) + shown_today
     picks = summarize.select(short, pick_cfg.get("interests", ""), model,
-                             avoid=[h["title"] for h in shown_today if h.get("title")])
+                             avoid=[h["title"] for h in recent if h.get("title")],
+                             focus_hint=rank.focus_hint(focus, weights))
     log.info("picks: %s", [(p["id"], short[p["id"]].title) for p in picks])
 
     for p in picks:
@@ -196,6 +216,8 @@ def run(force: bool, if_missing: bool, dry_run: bool) -> int:
                        "reason": q["reason"]} for q in picks if q is not p]
         rec = build_record(day, c, art, summ, evidence, model, alternates, observed_at, head)
         rec["pick_reason"] = p["reason"]
+        rec["focus"] = focus
+        rec["kind"] = c.extra.get("kind")
         if shown_today:
             rec["replaced"] = shown_today  # 翌日以降の重複除外にも使う（store.history）
         if dry_run:
@@ -219,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--if-missing", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="保存せず表示だけ")
+    ap.add_argument("--focus", choices=[*rank.FOCUS_PRESETS, "custom"],
+                    help="run で選ぶ種類（指定しなければ config.toml の [pick] focus）")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--no-color", action="store_true")
     args, rest = ap.parse_known_args(argv)
@@ -237,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("別の trend run が実行中です。", file=sys.stderr)
                 return EXIT_BUSY
             try:
-                return run(args.force, args.if_missing, args.dry_run)
+                return run(args.force, args.if_missing, args.dry_run, args.focus)
             except Exception:
                 log.error("run failed:\n%s", traceback.format_exc())
                 print("生成に失敗しました。詳細: " + str(LOGS / f"{today_str()}.log"), file=sys.stderr)

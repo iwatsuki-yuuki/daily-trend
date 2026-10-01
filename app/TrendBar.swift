@@ -2084,6 +2084,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let gen = addAction(generating ? "生成中…" : "今すぐ生成／再生成", #selector(generateNow))
         gen.isEnabled = !generating
+        // 種類を絞って作り直す（その回だけ。毎朝の既定は config.toml の [pick] focus）
+        let focusItem = NSMenuItem(title: "種類を指定して生成", action: nil, keyEquivalent: "")
+        let focusMenu = NSMenu()
+        for (title, focus) in Self.focusChoices {
+            let item = NSMenuItem(title: title, action: #selector(generateWithFocus(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = focus
+            focusMenu.addItem(item)
+        }
+        focusItem.submenu = focusMenu
+        focusItem.isEnabled = !generating
+        menu.addItem(focusItem)
         if let note = generateNote { addInfo(note) }
         addAction("データフォルダを開く", #selector(openDataFolder))
         if PanelPositionStore.topLeft != nil {
@@ -2151,10 +2163,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: 生成（bin/trend run --force）
 
+    /// 「種類を指定して生成」の選択肢（表示名, trend run --focus の値。daily_trend/rank.py の FOCUS_PRESETS と同じ）
+    static let focusChoices: [(String, String)] = [
+        ("おまかせ（すべての種類）", "balanced"),
+        ("ニュース・発表", "news"),
+        ("テックブログ", "blogs"),
+        ("OSS・公開モデル", "oss"),
+        ("論文", "papers"),
+    ]
+
     /// trend run が「別の trend run が実行中」で何もしなかったときの終了コード（daily_trend/cli.py の EXIT_BUSY）
     static let exitBusy: Int32 = 75
 
     @objc private func generateNow() {
+        startGeneration(focus: nil)
+    }
+
+    @objc private func generateWithFocus(_ sender: NSMenuItem) {
+        guard let focus = sender.representedObject as? String, Self.focusChoices.contains(where: { $0.1 == focus }) else { return }
+        startGeneration(focus: focus)
+    }
+
+    /// focus が nil なら config.toml の [pick] focus に従う
+    private func startGeneration(focus: String?) {
         guard !generating else { return }
         guard FileManager.default.isExecutableFile(atPath: Paths.trendCommand.path) else {
             generateNote = "trend コマンドが見つかりません（~/daily-trend/bin/trend）"
@@ -2162,9 +2193,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-c", "$HOME/daily-trend/bin/trend run --force"]
+        let command = "trend run --force" + (focus.map { " --focus \($0)" } ?? "")
+        p.arguments = ["-c", "$HOME/daily-trend/bin/" + command]
         p.standardInput = FileHandle.nullDevice
-        let log = openGenerateLog()
+        let log = openGenerateLog(command: command)
         p.standardOutput = log ?? FileHandle.nullDevice
         p.standardError = log ?? FileHandle.nullDevice
         p.terminationHandler = { [weak self] proc in
@@ -2185,7 +2217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func openGenerateLog() -> FileHandle? {
+    private func openGenerateLog(command: String) -> FileHandle? {
         let fm = FileManager.default
         let dir = Paths.logsDir
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -2193,7 +2225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !fm.fileExists(atPath: url.path) { fm.createFile(atPath: url.path, contents: nil) }
         guard let fh = try? FileHandle(forWritingTo: url) else { return nil }
         fh.seekToEndOfFile()
-        let header = "\n==== \(DateUtil.fullFormatter.string(from: Date())) TrendBar: trend run --force ====\n"
+        let header = "\n==== \(DateUtil.fullFormatter.string(from: Date())) TrendBar: \(command) ====\n"
         fh.write(Data(header.utf8))
         return fh
     }

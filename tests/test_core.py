@@ -51,6 +51,23 @@ class RankTest(unittest.TestCase):
         self.assertEqual({x.platform for x in short[0].buzz}, {"Hacker News", "はてなブックマーク"})
         self.assertEqual(dropped, ["Other"])
 
+    def test_same_family_and_listing_only_sources_get_no_bonus(self):
+        def top(extra_source, url="https://github.com/o/r"):
+            cands = [Candidate("hackernews", "solo", "https://solo.com", 100), Candidate("github", "repo", "https://github.com/o/r", 100),
+                     Candidate(extra_source, "again", url, 100)]
+            return rank.shortlist(cands, [], 10)[0][0].title
+        self.assertEqual(top("hatena"), "repo")            # 別の場（はてブ）にも出ていれば加点
+        self.assertEqual(top("github_trending"), "solo")   # GitHub の2つの取得元は1つと数える
+        post = [Candidate("hackernews", "solo", "https://solo.com", 100), Candidate("hatena", "post", "https://blog.example/p", 100),
+                Candidate("techblogs", "post", "https://blog.example/p", 1)]
+        self.assertEqual(rank.shortlist(post, [], 10)[0][0].title, "solo")  # フィードに載っているだけでは加点しない
+
+    def test_each_source_gets_similar_slots(self):
+        big = [Candidate("hf_papers", f"p{i}", f"https://arxiv.org/abs/2609.{10000 + i}", 100 - i) for i in range(90)]
+        small = [Candidate("techmeme", f"t{i}", f"https://t{i}.com", 100 - i) for i in range(8)]
+        short, _ = rank.shortlist(big + small, [], 12)
+        self.assertEqual(sum(c.source == "techmeme" for c in short), 6)  # 件数の多い取得元が枠を占めない
+
     def test_multi_source_scores_higher(self):
         solo = [Candidate("hackernews", f"t{i}", f"https://s{i}.com", 100 - i) for i in range(5)]
         dup_hn = Candidate("hackernews", "dup", "https://dup.com", 1)
@@ -159,6 +176,104 @@ class RecordTest(unittest.TestCase):
                         cli._quality(ok, {"judged": True, "unsupported": ["見出し"]}))
 
 
+class FocusTest(unittest.TestCase):
+    def test_kind_of(self):
+        def kind(source, url, **extra):
+            return rank.kind_of(Candidate(source, "t", url, 1, extra=extra), blog_hosts=("engineering.dena.com",))
+        self.assertEqual(kind("hackernews", "https://example.com/post"), "news")
+        self.assertEqual(kind("hackernews", "https://github.com/a/b"), "oss")
+        self.assertEqual(kind("hackernews", "https://github.com/a/b/issues/3"), "news")  # issue はリポジトリの紹介ではない
+        self.assertEqual(kind("hatena", "https://zenn.dev/u/articles/x"), "blogs")
+        self.assertEqual(kind("hatena", "https://foo.hatenablog.com/entry/1"), "blogs")
+        self.assertEqual(kind("hatena", "https://engineering.dena.com/blog/2026/10/x/"), "blogs")  # config のブログ
+        self.assertEqual(kind("hatena", "https://www.itmedia.co.jp/news/articles/1.html"), "news")
+        self.assertEqual(kind("hackernews", "https://arxiv.org/abs/2609.01234"), "papers")
+        self.assertEqual(kind("techblogs", "https://techblog.example.co.jp/a"), "blogs")
+        self.assertEqual(kind("official", "https://openai.com/index/x"), "news")
+        self.assertEqual(kind("github_trending", "https://github.com/a/b"), "oss")
+        self.assertEqual(kind("hf_models", "https://huggingface.co/a/b"), "oss")
+        self.assertEqual(kind("hf_papers", "https://arxiv.org/abs/2609.01234"), "papers")
+
+    def _cands(self):
+        return ([Candidate("hackernews", f"n{i}", f"https://news{i}.com/a", 100 - i) for i in range(4)]
+                + [Candidate("zenn", f"z{i}", f"https://zenn.dev/u/articles/{i}", 50 - i) for i in range(4)]
+                + [Candidate("github", f"g{i}", f"https://github.com/o/r{i}", 30 - i) for i in range(4)])
+
+    def test_weights_filter_and_reorder(self):
+        short, _ = rank.shortlist(self._cands(), [], 40, weights={"news": 0, "blogs": 1, "oss": 0, "papers": 0})
+        self.assertEqual([c.title for c in short], ["z0", "z1", "z2", "z3"])
+        self.assertEqual({c.extra["kind"] for c in short}, {"blogs"})
+        # 重みが大きい種類は、同じ順位でも上に来る
+        short, _ = rank.shortlist(self._cands(), [], 40, weights={"news": 1, "blogs": 1, "oss": 3, "papers": 1})
+        self.assertEqual([c.title for c in short[:4]], ["g0", "g1", "g2", "g3"])
+        # 重みを渡さなければ今までどおり（取得元ごとの1位が並ぶ）
+        short, _ = rank.shortlist(self._cands(), [], 40)
+        self.assertEqual({c.title for c in short[:3]}, {"n0", "z0", "g0"})
+
+    def test_per_source_cap_grows_when_sources_are_few(self):
+        many = [Candidate("hf_papers", f"p{i}", f"https://arxiv.org/abs/2609.{10000 + i}", 100 - i) for i in range(30)]
+        short, _ = rank.shortlist(many + self._cands(), [], 40, weights={"news": 0, "blogs": 0, "oss": 0, "papers": 1})
+        self.assertEqual(len(short), 30)  # 1つの取得元だけになるときは、取得元ごとの上限 10 件で切らない
+        short, _ = rank.shortlist(many + self._cands(), [], 40)
+        self.assertEqual(sum(c.source == "hf_papers" for c in short), 10)
+
+    def test_focus_weights(self):
+        self.assertEqual(rank.focus_weights({}), ("balanced", {"news": 1.0, "blogs": 1.0, "oss": 1.0, "papers": 1.0}))
+        self.assertEqual(rank.focus_weights({"focus": "news"}, "blogs")[1], {"news": 0.0, "blogs": 1.0, "oss": 0.0, "papers": 0.0})
+        name, w = rank.focus_weights({"focus": "custom", "weights": {"blogs": 2, "papers": 0, "oss": -1}})
+        self.assertEqual(w, {"news": 1.0, "blogs": 2.0, "oss": 0.0, "papers": 0.0})
+        self.assertIn("テックブログ 2、ニュース・発表 1", rank.focus_hint(name, w))
+        self.assertIsNone(rank.focus_hint("balanced", rank.focus_weights({})[1]))
+        self.assertIsNone(rank.focus_hint("custom", rank.focus_weights({"focus": "custom"})[1]))  # すべて同じ重み
+        with self.assertRaises(ValueError):
+            rank.focus_weights({"focus": "blog"})
+        with self.assertRaises(ValueError):
+            rank.focus_weights({"focus": "custom", "weights": {"news": 0, "blogs": 0, "oss": 0, "papers": 0}})
+
+
+class SourcesTest(unittest.TestCase):
+    RSS = b"""<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Blog</title><link>https://b.example/</link>
+      <item><title><![CDATA[A &amp; B]]></title><link>https://b.example/a?utm_source=rss</link>
+        <description>&lt;p&gt;Hello  &lt;b&gt;world&lt;/b&gt;&lt;/p&gt;</description><pubDate>Wed, 30 Sep 2026 04:34:25 +0000</pubDate></item>
+      <item><title>no date</title><link>https://b.example/b</link></item></channel></rss>"""
+    ATOM = """<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><link href="https://a.example/"/>
+      <entry><title>記事</title><link rel="self" href="https://a.example/self"/><link rel="alternate" href="https://a.example/1"/>
+        <published>2026-09-29T10:00:00+09:00</published><updated>2026-10-01T00:00:00Z</updated><summary>s</summary></entry></feed>""".encode()
+    RDF = b"""<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/"
+      xmlns:dc="http://purl.org/dc/elements/1.1/"><item rdf:about="https://r.example/1"><title>R</title>
+      <link>https://r.example/1</link><dc:date>2026-09-28T00:00:00Z</dc:date></item></rdf:RDF>"""
+
+    def test_parse_feed(self):
+        from daily_trend import sources
+        rss = sources.parse_feed(self.RSS)
+        self.assertEqual([(e["title"], e["url"], e["summary"]) for e in rss], [("A & B", "https://b.example/a?utm_source=rss", "Hello world")])
+        self.assertEqual(rss[0]["published"].isoformat(), "2026-09-30T04:34:25+00:00")
+        atom = sources.parse_feed(self.ATOM)
+        self.assertEqual((atom[0]["title"], atom[0]["url"]), ("記事", "https://a.example/1"))
+        self.assertEqual(atom[0]["published"].isoformat(), "2026-09-29T10:00:00+09:00")  # updated より published
+        self.assertEqual(sources.parse_feed(self.RDF)[0]["url"], "https://r.example/1")
+
+    def test_feed_urls_ignores_malformed_config(self):
+        from daily_trend import sources
+        self.assertEqual(sources.feed_urls({"techblogs": {"A": "https://a.example/feed", "B": 3, "C": "feed.xml"}}, "techblogs"),
+                         {"A": "https://a.example/feed"})
+        self.assertEqual(sources.feed_urls({"techblogs": "https://a.example/feed"}, "techblogs"), {})
+        self.assertEqual(sources.feed_urls({}, "official"), {})
+
+    def test_github_new_repos_are_ranked_by_stars_per_day(self):
+        from datetime import datetime, timezone
+        from daily_trend import sources
+        now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        def repo(name, stars, created):
+            return {"full_name": name, "html_url": f"https://github.com/{name}", "stargazers_count": stars,
+                    "created_at": created, "description": "d", "language": "Go", "topics": []}
+        items = [repo("a/old", 9000, "2026-09-01T00:00:00Z"), repo("b/new", 2000, "2026-09-30T00:00:00Z"),
+                 repo("c/today", 500, "2026-09-30T18:00:00Z"), repo("b/new", 2000, "2026-09-30T00:00:00Z")]
+        out = sources.github_new_repos(items, now, "https://github.com/search")
+        self.assertEqual([c.title.split(" ")[0] for c in out], ["b/new", "c/today", "a/old"])  # 2000/日, 500/日, 300/日
+        self.assertIn("1日あたり約 2000", out[0].buzz[0].metric)
+
+
 class RegenerateTest(unittest.TestCase):
     """trend run --force で作り直すと、今日すでに出した記事は選ばれない。"""
 
@@ -169,18 +284,23 @@ class RegenerateTest(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         self.select_calls = []
 
-        def fetch_all(cfg):
-            return [Candidate("hackernews", t, f"https://ex.com/{t}", s) for t, s in (("a", 300), ("b", 200), ("c", 100))], {}
+        self.config = {}
+        self.hints = []
 
-        def select(short, interests, model, avoid=None):
+        def fetch_all(cfg, feeds=None):
+            return [Candidate("hackernews", t, f"https://ex.com/{t}", s) for t, s in (("a", 300), ("b", 200), ("c", 100))] + [
+                Candidate("zenn", "z", "https://zenn.dev/u/articles/z", 50)], {}
+
+        def select(short, interests, model, avoid=None, focus_hint=None):
             self.select_calls.append(([c.title for c in short], avoid))
+            self.hints.append(focus_hint)
             return [{"id": 0, "reason": "r"}]
 
         summ = {"category": "AI/ML", "headline": "h", "one_liner": "o", "why_now": "w", "terms": [], "points": []}
         patches = [
             mock.patch.object(store, "DAYS", tmp / "days"), mock.patch.object(store, "CANDIDATES", tmp / "candidates"),
             mock.patch.object(cli, "DAYS", tmp / "days"), mock.patch.object(cli, "LOGS", tmp / "logs"),
-            mock.patch.object(cli, "today_str", lambda: self.DAY), mock.patch.object(cli, "load_config", lambda: {}),
+            mock.patch.object(cli, "today_str", lambda: self.DAY), mock.patch.object(cli, "load_config", lambda: self.config),
             mock.patch.object(cli.sources, "fetch_all", fetch_all), mock.patch.object(cli.summarize, "select", select),
             mock.patch.object(cli.summarize, "summarize", lambda c, art, model: dict(summ)),
             mock.patch.object(cli.summarize, "verify", lambda s, art, model: ([], {"judged": True, "unsupported": []})),
@@ -202,22 +322,35 @@ class RegenerateTest(unittest.TestCase):
         self.assertEqual(self._run(), 0)
         self.assertEqual(self._url(), "https://ex.com/a")
         self.assertNotIn("replaced", store.load_day(self.DAY))  # 初回は置き換えた記事が無い
-        self.assertEqual(self.select_calls[-1], (["a", "b", "c"], []))
+        self.assertEqual(self.select_calls[-1], (["a", "z", "b", "c"], []))
+        self.assertEqual(self.hints[-1], None)  # balanced では選定の指示を変えない
+
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self._url(), "https://zenn.dev/u/articles/z")
+        self.assertEqual(self.select_calls[-1], (["z", "b", "c"], ["A"]))  # 既出は候補から外し、題名を選定に渡す
 
         self.assertEqual(self._run(), 0)
         self.assertEqual(self._url(), "https://ex.com/b")
-        self.assertEqual(self.select_calls[-1], (["b", "c"], ["A"]))  # 既出は候補から外し、題名を選定に渡す
 
         self.assertEqual(self._run(), 0)
         rec = store.load_day(self.DAY)
         self.assertEqual(rec["source"]["url"], "https://ex.com/c")
-        self.assertEqual([r["url"] for r in rec["replaced"]], ["https://ex.com/a", "https://ex.com/b"])
+        self.assertEqual([r["url"] for r in rec["replaced"]],
+                         ["https://ex.com/a", "https://zenn.dev/u/articles/z", "https://ex.com/b"])
         # 置き換える前の記事も、翌日以降は既出として扱う
         self.assertEqual([h["url"] for h in store.history("2026-10-02", 30)],
-                         ["https://ex.com/a", "https://ex.com/b", "https://ex.com/c"])
+                         ["https://ex.com/a", "https://zenn.dev/u/articles/z", "https://ex.com/b", "https://ex.com/c"])
 
         self.assertEqual(self._run(), 1)  # 出していない候補が残っていなければ失敗し、前の1件を残す
         self.assertEqual(self._url(), "https://ex.com/c")
+
+    def test_recent_days_are_passed_as_topics_to_avoid(self):
+        for day, title in (("2026-09-20", "old"), ("2026-09-25", "recent"), ("2026-09-30", "yesterday")):
+            store.save_day({"date": day, "source": {"url": f"https://past.example/{title}", "title": title}}, "")
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self.select_calls[-1][1], ["recent", "yesterday"])  # 7日より前の話題は渡さない
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self.select_calls[-1][1], ["recent", "yesterday", "A"])
 
     def test_without_force_keeps_the_record(self):
         self.assertEqual(self._run(), 0)
@@ -230,9 +363,30 @@ class RegenerateTest(unittest.TestCase):
     def test_dry_run_does_not_replace(self):
         self.assertEqual(self._run(), 0)
         self.assertEqual(self._run(dry_run=True), 0)
-        self.assertEqual(self.select_calls[-1], (["b", "c"], ["A"]))
+        self.assertEqual(self.select_calls[-1], (["z", "b", "c"], ["A"]))
         self.assertEqual(self._url(), "https://ex.com/a")
         self.assertNotIn("replaced", store.load_day(self.DAY))
+
+
+    def test_focus_limits_the_kind(self):
+        self.assertEqual(self._run(focus="blogs"), 0)  # --focus blogs
+        self.assertEqual(self.select_calls[-1][0], ["z"])
+        self.assertIn("技術ブログ", self.hints[-1])
+        rec = store.load_day(self.DAY)
+        self.assertEqual((rec["focus"], rec["kind"]), ("blogs", "blogs"))
+        self.assertEqual(self._run(focus="blogs"), 1)  # テックブログの未表示の候補が無いので失敗し、前の1件を残す
+        self.assertEqual(self._url(), "https://zenn.dev/u/articles/z")
+
+        self.config = {"pick": {"focus": "news"}}  # config.toml の既定
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self.select_calls[-1][0], ["a", "b", "c"])
+        self.assertEqual(self._run(focus="balanced"), 0)  # コマンドの指定が config より優先
+        self.assertEqual(self.select_calls[-1][0], ["b", "c"])
+
+    def test_bad_focus_in_config_falls_back_to_balanced(self):
+        self.config = {"pick": {"focus": "blog"}}  # 書き間違い。毎朝の生成は止めない
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self.select_calls[-1][0], ["a", "z", "b", "c"])
 
 
 class SelectPromptTest(unittest.TestCase):
@@ -247,12 +401,12 @@ class SelectPromptTest(unittest.TestCase):
             summarize.select([Candidate("hackernews", "T", "https://ex.com/t", 1)], "x", "m", avoid=avoid)
         return calls[0]
 
-    def test_avoid_is_added_only_when_regenerating(self):
+    def test_avoid_is_added_when_there_are_shown_articles(self):
         system, user = self._prompt(["Shown title"])
         self.assertIn("同じ話題", system.splitlines()[-1])
-        self.assertTrue(user.endswith("# 今日すでに出した記事\n- Shown title"))
+        self.assertTrue(user.endswith("# 最近すでに出した記事\n- Shown title"))
         system0, user0 = self._prompt([])
-        self.assertNotIn("今日すでに出した記事", system0 + user0)  # 通常の生成ではプロンプトを変えない
+        self.assertNotIn("すでに出した記事", system0 + user0)  # 出した記事が無ければプロンプトを変えない
         self.assertTrue(system.startswith(system0) and user.startswith(user0))
 
 

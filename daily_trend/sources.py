@@ -1,8 +1,12 @@
-"""取得元ごとの候補取得。どれも認証不要・1日1回・各1〜2リクエスト。
+"""取得元ごとの候補取得。どれも認証不要・1日1回。1つの相手（ホスト）への要求は1〜2回。
 
 各取得元の規約上の扱い（2026-09-28 に確認）:
 - Hacker News: Algolia の公開 API を使う。HN 本体の HTML は利用規約でスクレイピング禁止なので取得しない。
 - GitHub: 公式 Search API を使う。Trending ページの HTML 取得は GitHub AUP の許可用途（研究・アーカイブ）に入らないため使わない。
+- GitHub の急上昇: Trending ページの代わりに、GitHub の公開イベントを集めた公開データ（GH Archive 由来。ClickHouse の
+  公開プレイグラウンド）で直近24時間のスター数を数える。全件ではなく標本なので、数は「標本内の件数」として表示する。
+- 企業のテックブログ / 公式ブログ: 各サイトが配信している RSS・Atom だけを読む（robots.txt で拒否されていれば読まない）。
+  はてなブックマーク数は公式の件数取得 API で取る。
 - Hugging Face: 公開 API（/api/daily_papers, /api/models）。
 - はてなブックマーク / Zenn / Qiita: 公式 RSS・フィード（Zenn は広く使われている非公式 API）。本文は保存・転載しない。
 - Lobsters: 使わない。robots.txt が一般ボットに全パス（RSS を含む）を拒否し、ai-input=no を宣言している。
@@ -16,6 +20,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 import time
 import urllib.error
@@ -23,8 +28,11 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
-from .common import Buzz, Candidate, http_get, http_json, to_local_date
+from .common import Buzz, Candidate, http_get, http_get_bytes, http_json, robots_allowed, to_local_date
+
+log = logging.getLogger("daily_trend")
 
 
 # ---------- Hacker News (Algolia) ----------
@@ -48,23 +56,81 @@ def hackernews() -> list[Candidate]:
     return out
 
 
-# ---------- GitHub (Search API: 直近に作られたリポジトリをスター順) ----------
-def github() -> list[Candidate]:
-    since = (datetime.now(timezone.utc).date() - timedelta(days=3)).isoformat()  # created: は UTC 基準
-    q = f"created:>={since}"
+# ---------- GitHub (Search API: 最近作られたリポジトリを、1日あたりのスター数順) ----------
+_GH_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+GH_NEW_DAYS = 30      # 「最近作られた」とみなす日数
+GH_MIN_STARS = 300    # 30日以内の検索で拾う下限（3日以内の検索には下限を付けない）
+
+
+def _gh_search(q: str, per_page: int) -> list[dict]:
     url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
-        {"q": q, "sort": "stars", "order": "desc", "per_page": 20})
-    data = http_json(url, headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
-    web = "https://github.com/search?" + urllib.parse.urlencode({"q": q, "type": "repositories", "s": "stars", "o": "desc"})
-    out = []
-    for x in data.get("items", []):
+        {"q": q, "sort": "stars", "order": "desc", "per_page": per_page})
+    return http_json(url, headers=_GH_HEADERS).get("items", [])
+
+
+def _gh_title(x: dict) -> str:
+    return x["full_name"] + (f" — {x['description']}" if x.get("description") else "")
+
+
+def _gh_description(x: dict) -> str:
+    return (x.get("description") or "") + f" [language: {x.get('language')}, topics: {', '.join(x.get('topics') or [])}]"
+
+
+def github_new_repos(items: list[dict], now: datetime, web: str) -> list[Candidate]:
+    """検索結果を1日あたりのスター数で並べる。作成から1日未満は1日として割る。"""
+    out, seen = [], set()
+    for x in items:
+        if x["full_name"] in seen:
+            continue
+        seen.add(x["full_name"])
+        stars = x.get("stargazers_count") or 0
+        created = datetime.fromisoformat(x["created_at"].replace("Z", "+00:00"))
+        per_day = stars / max((now - created).total_seconds() / 86400, 1.0)
         out.append(Candidate(
-            source="github", title=x["full_name"] + (f" — {x['description']}" if x.get("description") else ""),
-            url=x["html_url"], score=x.get("stargazers_count") or 0,
-            buzz=[Buzz("GitHub（3日以内に作成されたリポジトリのスター数順）", web,
-                       f"★{x.get('stargazers_count')}（{to_local_date(x.get('created_at'))} 作成）")],
-            published=to_local_date(x.get("created_at")), lang="en",
-            description=(x.get("description") or "") + f" [language: {x.get('language')}, topics: {', '.join(x.get('topics') or [])}]",
+            source="github", title=_gh_title(x), url=x["html_url"], score=per_day,
+            buzz=[Buzz(f"GitHub（{GH_NEW_DAYS}日以内に作成されたリポジトリ。1日あたりのスター数順）", web,
+                       f"★{stars}（{to_local_date(x.get('created_at'))} 作成、1日あたり約 {per_day:.0f}）")],
+            published=to_local_date(x.get("created_at")), lang="en", description=_gh_description(x),
+        ))
+    out.sort(key=lambda c: c.score, reverse=True)
+    return out[:30]
+
+
+def github() -> list[Candidate]:
+    today = datetime.now(timezone.utc).date()  # created: は UTC 基準
+    q_month = f"created:>={(today - timedelta(days=GH_NEW_DAYS)).isoformat()} stars:>={GH_MIN_STARS}"
+    q_fresh = f"created:>={(today - timedelta(days=3)).isoformat()}"  # 出来たばかりで、まだスターが少ないもの
+    items = _gh_search(q_month, 50) + _gh_search(q_fresh, 20)
+    web = "https://github.com/search?" + urllib.parse.urlencode({"q": q_month, "type": "repositories", "s": "stars", "o": "desc"})
+    return github_new_repos(items, datetime.now(timezone.utc), web)
+
+
+# ---------- GitHub の急上昇（作成時期を問わず、直近24時間にスターが多く付いたリポジトリ）----------
+_GH_EVENTS_SQL = ("SELECT repo_name, uniq(actor_login) AS n FROM github_events "
+                  "WHERE event_type = 'WatchEvent' AND created_at > now() - INTERVAL 1 DAY "
+                  "GROUP BY repo_name ORDER BY n DESC LIMIT 25 FORMAT JSON")
+GH_TREND_MIN_SAMPLE = 15   # 1位がこれ未満なら、標本が少なすぎて順位が当てにならないので使わない
+
+
+def github_trending() -> list[Candidate]:
+    rows = http_json("https://play.clickhouse.com/?" + urllib.parse.urlencode({"user": "play", "query": _GH_EVENTS_SQL}),
+                     timeout=30).get("data", [])
+    rows = [(r["repo_name"], int(r["n"])) for r in rows if re.fullmatch(r"[\w.-]+/[\w.-]+", r.get("repo_name") or "")]
+    if not rows or rows[0][1] < GH_TREND_MIN_SAMPLE:
+        raise RuntimeError(f"star events sample too small (top={rows[0][1] if rows else 0})")
+    rows = rows[:20]
+    # 説明・累計スター数は GitHub の公式 API で取る（消えたリポジトリは結果に出ないので、そのまま落とす）
+    info = {x["full_name"].lower(): x for x in _gh_search(" ".join(f"repo:{name}" for name, _ in rows), len(rows))}
+    out = []
+    for rank_, (name, n) in enumerate(rows, 1):
+        x = info.get(name.lower())
+        if x is None:
+            continue
+        out.append(Candidate(
+            source="github_trending", title=_gh_title(x), url=x["html_url"], score=n,
+            buzz=[Buzz("GitHub（直近24時間にスターが多く付いたリポジトリ。公開イベントの標本集計）", x["html_url"] + "/stargazers",
+                       f"{rank_} 位（標本内 {n} 件）/ 累計 ★{x.get('stargazers_count')}")],
+            published=to_local_date(x.get("created_at")), lang="en", description=_gh_description(x),
         ))
     return out
 
@@ -227,9 +293,115 @@ def techmeme() -> list[Candidate]:
     return out
 
 
+# ---------- 企業のテックブログ / 公式ブログ（config.toml の [feeds.*] に書いた RSS・Atom）----------
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _feed_date(s: str | None) -> datetime | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        d = parsedate_to_datetime(s)  # RSS 2.0（RFC 822）
+    except (TypeError, ValueError):
+        try:
+            d = datetime.fromisoformat(s.replace("Z", "+00:00"))  # Atom / RSS 1.0（ISO 8601）
+        except ValueError:
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _plain(s: str | None, limit: int = 300) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", html.unescape(s or "")))).strip()[:limit]
+
+
+def parse_feed(raw: bytes) -> list[dict]:
+    """RSS 2.0 / RSS 1.0 / Atom の記事一覧。公開日が読めない記事は、新しいかどうか分からないので捨てる。"""
+    out = []
+    for el in ET.fromstring(raw).iter():
+        if _local(el.tag) not in ("item", "entry"):
+            continue
+        title = link = summary = ""
+        dates: dict[str, datetime] = {}
+        for ch in el:
+            name = _local(ch.tag)
+            if name == "title":
+                title = _plain("".join(ch.itertext()), 200)
+            elif name == "link":
+                href = ch.get("href")  # Atom は属性、RSS は中身
+                if href is None:
+                    link = link or (ch.text or "").strip()
+                elif ch.get("rel") in (None, "alternate"):
+                    link = href.strip()
+            elif name in ("pubDate", "published", "date", "updated"):
+                d = _feed_date(ch.text)
+                if d:
+                    dates[name] = d
+            elif name in ("description", "summary") and not summary:
+                summary = _plain("".join(ch.itertext()))
+        when = next((dates[k] for k in ("pubDate", "published", "date", "updated") if k in dates), None)
+        if title and link.startswith(("http://", "https://")) and when:
+            out.append({"title": title, "url": link, "published": when, "summary": summary})
+    return out
+
+
+def hatena_counts(urls: list[str]) -> dict[str, int]:
+    """はてなブックマーク数（公式の件数取得 API。1回に 50 URL まで）。取れなければ 0 件として扱う。"""
+    counts: dict[str, int] = {}
+    for i in range(0, len(urls), 50):
+        qs = urllib.parse.urlencode([("url", u) for u in urls[i:i + 50]])
+        try:
+            counts.update(http_json("https://bookmark.hatenaapis.com/count/entries?" + qs, timeout=15))
+        except Exception as e:
+            log.warning("hatena count failed: %s", e)
+    return counts
+
+
+def _hatena_entry_url(link: str) -> str:
+    return "https://b.hatena.ne.jp/entry/" + ("s/" + link[8:] if link.startswith("https://") else link[7:])
+
+
+def feed_candidates(source: str, feeds: dict[str, str], max_age_days: int, lang: str) -> list[Candidate]:
+    """feeds = {表示名: フィードの URL}。max_age_days 日以内の記事を、はてブ数と新しさで並べる。"""
+    now = datetime.now(timezone.utc)
+
+    def one(item: tuple[str, str]) -> list[dict]:
+        name, url = item
+        try:
+            if not robots_allowed(url):
+                raise RuntimeError("robots.txt disallows the feed")
+            raw, _ = http_get_bytes(url, timeout=15, retries=1, headers={"Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"})
+            entries = parse_feed(raw)
+        except Exception as e:  # 1つのフィードが落ちても他は続ける
+            log.warning("feed %s (%s) failed: %s: %s", name, url, type(e).__name__, e)
+            return []
+        fresh = [dict(e, feed=name, feed_url=url) for e in entries
+                 if timedelta(0) <= now - e["published"] <= timedelta(days=max_age_days)]
+        return fresh[:5]  # 1つのブログが候補を占めないようにする
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        entries = [e for chunk in ex.map(one, feeds.items()) for e in chunk]
+    counts = hatena_counts([e["url"] for e in entries])
+    out = []
+    for e in entries:
+        n = int(counts.get(e["url"]) or 0)
+        age_days = (now - e["published"]).total_seconds() / 86400
+        day = e["published"].astimezone().strftime("%Y-%m-%d")
+        buzz = [Buzz(f"{e['feed']}（公式フィード）", e["feed_url"], f"{day} 公開")]
+        if n:
+            buzz.append(Buzz("はてなブックマーク", _hatena_entry_url(e["url"]), f"{n} users"))
+        out.append(Candidate(
+            source=source, title=e["title"], url=e["url"], score=(n + 1) / (1 + age_days),
+            buzz=buzz, published=day, lang=lang, description=f"{e['feed']}: {e['summary']}",
+        ))
+    return out
+
+
 FETCHERS = {
     "hackernews": hackernews,
     "github": github,
+    "github_trending": github_trending,
     "hf_papers": hf_papers,
     "hf_models": hf_models,
     "hatena": hatena,
@@ -238,12 +410,31 @@ FETCHERS = {
     "techmeme": techmeme,
 }
 
+# config.toml の [feeds.<キー>] を読む取得元。値は記事の言語（要約前の目安）
+FEED_SOURCES = {"techblogs": "ja", "official": "en"}
 
-def fetch_all(enabled: dict) -> tuple[list[Candidate], dict[str, str]]:
-    keys = [k for k in FETCHERS if enabled.get(k, True)]
+
+def feed_urls(feeds: dict, key: str) -> dict[str, str]:
+    """config.toml の [feeds.<key>] から {表示名: URL}。書き方が違う行は無視する。"""
+    section = feeds.get(key)
+    if not isinstance(section, dict):
+        return {}
+    return {k: v for k, v in section.items() if isinstance(v, str) and v.startswith(("http://", "https://"))}
+
+
+def fetch_all(enabled: dict, feeds: dict | None = None) -> tuple[list[Candidate], dict[str, str]]:
+    feeds = feeds or {}
+    max_age = feeds.get("max_age_days", 7)
+    max_age = max_age if isinstance(max_age, int) and max_age > 0 else 7
+    fetchers = dict(FETCHERS)
+    for key, lang in FEED_SOURCES.items():
+        urls = feed_urls(feeds, key)
+        if urls:  # フィードが1つも書かれていない取得元は、無いものとして扱う
+            fetchers[key] = lambda key=key, urls=urls, lang=lang: feed_candidates(key, urls, max_age, lang)
+    keys = [k for k in fetchers if enabled.get(k, True)]
     cands, errors = [], {}
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {k: ex.submit(FETCHERS[k]) for k in keys}
+        futs = {k: ex.submit(fetchers[k]) for k in keys}
         for k, f in futs.items():
             try:
                 items = f.result(timeout=90)

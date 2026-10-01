@@ -6,8 +6,8 @@
 model = "claude-opus-5"
 # 何日前までに選んだ記事を「既出」として除外するか
 dedupe_days = 30
-# 選考に回す候補の最大件数（スコア上位から）
-max_candidates = 40
+# 選考に回す候補の最大件数（各取得元の上位から、ほぼ同じ件数ずつ）
+max_candidates = 60
 
 # 選ぶときの優先順位。上から優先。
 interests = """
@@ -18,17 +18,82 @@ interests = """
 優先度を下げるもの: 資金調達・人事・株価・訴訟だけの話題、ゴシップ、特定製品の宣伝記事、個人の感想エッセイ
 """
 
+# どの種類から選ぶか。
+#   "balanced"  すべての種類から選ぶ
+#   "news"      ニュース・発表だけ（新しいモデル・製品・バージョンなど。HN / Techmeme / はてブ / 公式ブログ）
+#   "blogs"     テックブログだけ（Zenn / Qiita / 企業のテックブログ）
+#   "oss"       OSS・公開モデルだけ（GitHub / Hugging Face のモデル）
+#   "papers"    論文だけ（Hugging Face Daily Papers）
+#   "custom"    下の [pick.weights] の重みを使う
+# その回だけ変えるときは `trend run --force --focus blogs`、または TrendBar のメニュー「種類を指定して生成」。
+focus = "balanced"
+
+# focus = "custom" のときだけ使う重み。大きい種類ほど候補の上位に入る。0 にするとその種類を候補から外す。
+[pick.weights]
+news = 1.0
+blogs = 1.0
+oss = 1.0
+papers = 1.0
+
 [sources]
 # true/false で取得元を切り替える
 hackernews = true
-github = true        # 公式 Search API（3日以内に作成・スター順）
+github = true        # 公式 Search API（30日以内に作成・1日あたりのスター数順）
+github_trending = true  # 直近24時間にスターが多く付いたリポジトリ（作成時期を問わない。公開イベントの標本集計）
 hf_papers = true
 hf_models = true
 hatena = true
 zenn = true
 qiita = true
 techmeme = true      # X での反応数（Techmeme が収集した投稿数）もここから取る
+techblogs = true     # 企業のテックブログ（下の [feeds.techblogs]）
+official = true      # 公式ブログ（下の [feeds.official]）
 # reddit / lobsters / x は使わない（規約・robots.txt が自動取得を拒否。README 参照）
+
+# RSS / Atom で読むブログ。「表示名 = フィードの URL」で足したり消したりできる。
+# 候補にするのは max_age_days 日以内の記事で、1つのブログにつき新しい順に5件まで。はてなブックマーク数と新しさで並べる。
+[feeds]
+max_age_days = 7
+
+# 企業のテックブログ（種類は「テックブログ」）
+[feeds.techblogs]
+"DeNA" = "https://engineering.dena.com/blog/index.xml"
+"メルカリ" = "https://engineering.mercari.com/blog/feed.xml"
+"サイバーエージェント" = "https://developers.cyberagent.co.jp/blog/feed/"
+"LINEヤフー" = "https://techblog.lycorp.co.jp/ja/feed/index.xml"
+"クックパッド" = "https://techlife.cookpad.com/feed"
+"ZOZO" = "https://techblog.zozo.com/feed"
+"SmartHR" = "https://tech.smarthr.jp/feed"
+"Sansan" = "https://buildersbox.corp-sansan.com/feed"
+"freee" = "https://developers.freee.co.jp/feed"
+"マネーフォワード" = "https://moneyforward-dev.jp/feed"
+"LayerX" = "https://tech.layerx.co.jp/feed"
+"サイボウズ" = "https://blog.cybozu.io/feed"
+"はてな" = "https://developer.hatenastaff.com/feed"
+"ピクシブ" = "https://inside.pixiv.blog/rss"
+"GMOペパボ" = "https://tech.pepabo.com/feed.rss"
+"タイミー" = "https://tech.timee.co.jp/feed"
+"MIXI" = "https://mixi-developers.mixi.co.jp/feed"
+"ファインディ" = "https://tech.findy.co.jp/feed"
+"GMOインターネットグループ" = "https://developers.gmo.jp/feed/"
+"ナレッジワーク" = "https://zenn.dev/p/knowledgework/feed"
+
+# 公式ブログ（種類は「ニュース・発表」。新しいモデル・製品・バージョンの発表を一次情報で拾う）
+[feeds.official]
+"OpenAI" = "https://openai.com/news/rss.xml"
+"Google" = "https://blog.google/technology/ai/rss/"
+"Google DeepMind" = "https://deepmind.google/blog/rss.xml"
+"Hugging Face" = "https://huggingface.co/blog/feed.xml"
+"Mistral AI" = "https://mistral.ai/rss.xml"
+"GitHub" = "https://github.blog/feed/"
+"Cloudflare" = "https://blog.cloudflare.com/rss/"
+"Vercel" = "https://vercel.com/atom"
+"Meta Engineering" = "https://engineering.fb.com/feed/"
+"AWS" = "https://aws.amazon.com/blogs/aws/feed/"
+"Rust" = "https://blog.rust-lang.org/feed.xml"
+"Go" = "https://go.dev/blog/feed.atom"
+"TypeScript" = "https://devblogs.microsoft.com/typescript/feed/"
+"Swift" = "https://www.swift.org/atom.xml"
 
 [app]
 # TrendBar のグローバルホットキー（修飾キー: ctrl, option, cmd, shift / キー: a-z, 0-9）
