@@ -1,0 +1,6 @@
+#!/bin/zsh
+# trend コマンド本体。~/.local/bin/trend からシンボリックリンクで呼ばれる。
+# コードの場所はこのスクリプトの実体から求める（${0:A} はリンクを解決した絶対パス）。
+# データの場所は DAILY_TREND_HOME（未設定なら ~/daily-trend）。
+CODE="${0:A:h:h}"
+PYTHONPATH="$CODE" exec "$CODE/.venv/bin/python" -m daily_trend.cli "$@"

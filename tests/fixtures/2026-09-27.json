@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-27",
+  "generated_at": "2026-09-27T07:00:12+09:00",
+  "model": "claude-opus-5",
+  "category": "AI/ML",
+  "headline": "（表示確認用のダミー）小型LLMの推論を2倍速にする手法が公開",
+  "one_liner": "これは表示確認用のダミーデータです。実データではありません。",
+  "points": [
+    "1つ目の要点。短い文で書く。60字程度まで入る想定の長さのテキストをここに置いて折り返しを確認する。",
+    "2つ目の要点。数値を含む（例: 2.1倍、GPU 1枚）。",
+    "3つ目の要点。自分の研究との関係を書く欄ではない。"
+  ],
+  "why_now": "Hacker News で 812 points、はてブで 450 users（取得時点）。",
+  "terms": [
+    { "term": "投機的デコーディング", "explain": "小さいモデルで先に候補を出し、大きいモデルでまとめて検証する推論高速化の方法。" }
+  ],
+  "source": {
+    "title": "Dummy article title for layout test",
+    "url": "https://example.com/dummy-article",
+    "site": "example.com",
+    "published_at": "2026-09-26",
+    "lang": "en"
+  },
+  "buzz": [
+    { "platform": "Hacker News", "url": "https://news.ycombinator.com/item?id=1", "metric": "812 points / 340 comments", "observed_at": "2026-09-27T07:00:05+09:00" },
+    { "platform": "はてなブックマーク", "url": "https://b.hatena.ne.jp/entry/s/example.com/dummy-article", "metric": "450 users", "observed_at": "2026-09-27T07:00:05+09:00" }
+  ],
+  "evidence": [
+    { "point_index": 0, "quote": "dummy quote one", "verified": true },
+    { "point_index": 1, "quote": "dummy quote two", "verified": true },
+    { "point_index": 2, "quote": "dummy quote three", "verified": false }
+  ],
+  "warnings": ["要点3の根拠となる引用が本文中に見つかりませんでした"],
+  "alternates": [
+    { "title": "Runner-up candidate A", "url": "https://example.com/a", "buzz_url": "https://news.ycombinator.com/item?id=2", "reason": "次点の理由（ダミー）" },
+    { "title": "Runner-up candidate B", "url": "https://example.com/b", "buzz_url": null, "reason": "次点の理由（ダミー）" }
+  ]
+}

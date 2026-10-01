@@ -1,0 +1,35 @@
+# daily-trend 設定
+# 変更したら次回の `trend run` から反映される（TrendBar のホットキーはアプリ再起動で反映）。
+
+[pick]
+# 要約に使う Claude のモデル。安くしたいときは "claude-sonnet-5" や "claude-haiku-4-5" に変える。
+model = "claude-opus-5"
+# 何日前までに選んだ記事を「既出」として除外するか
+dedupe_days = 30
+# 選考に回す候補の最大件数（スコア上位から）
+max_candidates = 40
+
+# 選ぶときの優先順位。上から優先。
+interests = """
+1. AI/ML の新しい手法・モデル・論文・ツール（LLM、エージェント、学習・推論の効率化、評価手法）
+2. 科学計算・シミュレーション × 機械学習
+3. 開発ツール・プログラミング環境の大きな変化（エディタ、AI コーディング、言語・ランタイム）
+4. その他、技術者の間で広く話題になっている技術ニュース
+優先度を下げるもの: 資金調達・人事・株価・訴訟だけの話題、ゴシップ、特定製品の宣伝記事、個人の感想エッセイ
+"""
+
+[sources]
+# true/false で取得元を切り替える
+hackernews = true
+github = true        # 公式 Search API（3日以内に作成・スター順）
+hf_papers = true
+hf_models = true
+hatena = true
+zenn = true
+qiita = true
+techmeme = true      # X での反応数（Techmeme が収集した投稿数）もここから取る
+# reddit / lobsters / x は使わない（規約・robots.txt が自動取得を拒否。README 参照）
+
+[app]
+# TrendBar のグローバルホットキー（修飾キー: ctrl, option, cmd, shift / キー: a-z, 0-9）
+hotkey = "option+t"

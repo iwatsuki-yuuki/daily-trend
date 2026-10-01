@@ -1,0 +1,16 @@
+.venv/
+build/
+data/
+__pycache__/
+*.pyc
+
+# 鍵・秘密情報（公開しない）
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+credentials*
+
+# macOS
+.DS_Store
