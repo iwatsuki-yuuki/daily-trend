@@ -6,7 +6,7 @@
   trend buzz         話題元（HN / はてブ など）を開く
   trend cite         引用元を Markdown で表示（クリップボードにもコピー）
   trend ls           過去の見出し一覧
-  trend run          今日の1件を生成（--force で作り直し、--if-missing で未生成時のみ）
+  trend run          今日の1件を生成（--force で別の記事に作り直し、--if-missing で未生成時のみ）
   trend path         データの場所を表示
 """
 from __future__ import annotations
@@ -151,7 +151,9 @@ def run(force: bool, if_missing: bool, dry_run: bool) -> int:
     for k, e in errors.items():
         log.warning("source %s failed: %s", k, e)
     log.info("fetched %d candidates from %d sources", len(cands), len({c.source for c in cands}))
-    hist = store.history(day, int(pick_cfg.get("dedupe_days", 30)))
+    # 作り直し（--force）のときは、今日すでに出した記事も既出として除き、別の記事を選ぶ
+    shown_today = store.shown(store.load_day(day))
+    hist = store.history(day, int(pick_cfg.get("dedupe_days", 30))) + shown_today
     short, dropped = rank.shortlist(cands, hist, int(pick_cfg.get("max_candidates", 40)))
     store.save_candidates(day, {"observed_at": observed_at, "errors": errors, "dropped_as_seen": dropped,
                                 "shortlist": [c.to_dict() for c in short]})
@@ -162,7 +164,8 @@ def run(force: bool, if_missing: bool, dry_run: bool) -> int:
 
     if if_missing:
         attempts.write_text(str(n + 1))  # ネットワーク取得まで成功し、API を呼ぶ回だけ数える
-    picks = summarize.select(short, pick_cfg.get("interests", ""), model)
+    picks = summarize.select(short, pick_cfg.get("interests", ""), model,
+                             avoid=[h["title"] for h in shown_today if h.get("title")])
     log.info("picks: %s", [(p["id"], short[p["id"]].title) for p in picks])
 
     for p in picks:
@@ -193,6 +196,8 @@ def run(force: bool, if_missing: bool, dry_run: bool) -> int:
                        "reason": q["reason"]} for q in picks if q is not p]
         rec = build_record(day, c, art, summ, evidence, model, alternates, observed_at, head)
         rec["pick_reason"] = p["reason"]
+        if shown_today:
+            rec["replaced"] = shown_today  # 翌日以降の重複除外にも使う（store.history）
         if dry_run:
             print(render.to_terminal(rec, show_evidence=True))
             return 0

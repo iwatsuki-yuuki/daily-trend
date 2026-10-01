@@ -48,14 +48,20 @@ def save_candidates(day: str, payload: dict) -> None:
     _atomic_write(CANDIDATES / f"{day}.json", json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
 
 
+def shown(rec: dict | None) -> list[dict]:
+    """その日に出した記事。同じ日に作り直したときは、置き換える前に出していた記事（replaced）も含む。"""
+    if not rec:
+        return []
+    src = rec.get("source") or {}
+    return [*(rec.get("replaced") or []), {"url": src.get("url"), "title": src.get("title")}]
+
+
 def history(today: str, days_back: int) -> list[dict]:
-    """過去 days_back 日に選んだ記事（重複除外用）。"""
+    """過去 days_back 日に出した記事（重複除外用）。"""
     start = date.fromisoformat(today) - timedelta(days=days_back)
     out = []
     for d in list_days():
         if not (start.isoformat() <= d < today):
             continue
-        rec = load_day(d) or {}
-        src = rec.get("source") or {}
-        out.append({"url": src.get("url"), "title": src.get("title")})
+        out.extend(shown(load_day(d)))
     return out

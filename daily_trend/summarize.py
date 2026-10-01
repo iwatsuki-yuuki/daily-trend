@@ -131,7 +131,8 @@ def _cand_line(i: int, c: Candidate) -> str:
     return f"[{i}] {c.title}\n    site: {re.sub(r'^https?://', '', c.url)[:80]}\n    話題: {buzz}\n    説明: {desc}"
 
 
-def select(cands: list[Candidate], interests: str, model: str) -> list[dict]:
+def select(cands: list[Candidate], interests: str, model: str, avoid: list[str] | None = None) -> list[dict]:
+    """avoid: 今日すでに出した記事の題名（作り直しのとき）。同じ話題の別記事を選ばせないために渡す。"""
     listing = "\n".join(_cand_line(i, c) for i, c in enumerate(cands))
     system = ("あなたは技術ニュースの編集者です。候補の中から、読者が今日1分で読む価値が最も高い技術トピックを選びます。\n"
               "選ぶ基準: (1) 読者の関心の優先順位に合う (2) 今日実際に話題になっている（数値が大きい・複数の場で話題）"
@@ -140,6 +141,10 @@ def select(cands: list[Candidate], interests: str, model: str) -> list[dict]:
               "その場合は、その話題の一次情報に最も近い候補（公式発表・本人の解説・論文）を選ぶ。\n"
               "元記事の本文を取得できない可能性があるので、3件を推す順に返す。")
     user = f"# 読者の関心（上ほど優先）\n{interests.strip()}\n\n# 候補（{len(cands)}件）\n{listing}"
+    if avoid:
+        system += ("\n読者は「今日すでに出した記事」を読んだうえで、別の話題を求めている。"
+                   "それと同じ話題（同じ製品・同じ発表・同じ出来事）の候補は選ばない。")
+        user += "\n\n# 今日すでに出した記事\n" + "\n".join(f"- {t}" for t in avoid)
     out = _call(model, system, user, SELECT_SCHEMA, effort="low")
     seen, picks = set(), []
     for p in out["picks"]:
