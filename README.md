@@ -89,9 +89,34 @@ Claude API を1日に3〜5回呼ぶ（選定1回・要約1〜2回・判定1〜2�
 
 ## インストール / アンインストール
 
+### 必要なもの
+
+- macOS 13 以降（Apple シリコン）
+- Xcode Command Line Tools（`git` と `swiftc` を使う）: `xcode-select --install`
+- [uv](https://docs.astral.sh/uv/)（Python と依存パッケージを入れる）: `brew install uv`
+- Anthropic の API キー: `~/.zshenv` に `export ANTHROPIC_API_KEY=...` を書く
+
+### 手順
+
+置き場所は `~/daily-trend` 固定。別の場所に置くと動かない。
+
 ```bash
+git clone https://github.com/iwatsuki-yuuki/daily-trend.git ~/daily-trend
 ~/daily-trend/install.sh
 ```
+
+`install.sh` は次のことをする。
+
+1. `.venv` を作り、`requirements.txt` のパッケージを入れる。
+2. `trend` コマンドを `~/.local/bin` に置く。
+3. TrendBar.app をビルドする。
+4. launchd に登録する（毎朝の生成と TrendBar の常駐）。
+
+`trend` コマンドを使うには `~/.local/bin` に PATH を通す。通っていなければ `~/.zshrc` に `export PATH="$HOME/.local/bin:$PATH"` を足す。
+
+インストール直後はまだ1件も無い。最初の1件は `trend run` か、メニューバーの「今すぐ生成／再生成」で作る（1分ほど）。
+
+### アンインストール
 
 ```bash
 ~/daily-trend/uninstall.sh
